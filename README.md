@@ -4,6 +4,9 @@
 新增、替换或删除以 `/` 开头的 HTML 页面；服务在**同一个 SQLite 写事务**内先试用整批改动，
 再核对最终所有页面的站内 `href`，全部通过才提交发布，否则内容与修订号均不变。
 
+服务还提供**页面搬迁**能力：提交预期修订号、已发布且非 `/index.html` 的旧路径与未占用的
+新路径，搬迁后旧路径消失、新页面保留原有正文与 `id`，相关站内链接同步改指/重定位。
+
 ## 一键启动
 
 ```bash
@@ -45,6 +48,28 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
   `path escapes site root`）。
 - 校验与发布在同一个 `BEGIN IMMEDIATE` 写事务中完成，读接口永远只读到完整提交的快照。
 
+### 页面搬迁（`POST /move`）
+
+请求体 `{"expected_revision":n,"old_path":"/old.html","new_path":"/new.html"}`，规则：
+
+- **前置条件**：`old_path` 必须在当前修订中已发布，且不能是 `/index.html`；
+  `new_path` 必须未被占用。违反返回 `422`，内容与修订号不变。
+- **正文与 id 保留**：搬迁后的新页面逐字保留原正文文本、元素 `id` 与其他属性；
+  旧路径从整包消失。
+- **其他页面**：凡站内 `href` 原本指向旧页（含 `#fragment`、目录形式等），一律改指
+  新页；绝对链接改绝对、相对链接改相对（相对引用基于各自所在目录重新计算）。
+- **搬迁页自身**：相对 `href` 以新页面位置重新定位，使原本指向的页面与片段在搬迁后
+  仍可到达；指向旧页的链接（含绝对自指）改指新页；纯片段（`#x`）、纯查询（`?x`）
+  等同页引用原样保留。
+- **查询参数与片段**：改写只替换路径段，`?a=b`、`#frag` 原文照旧保留。
+- **外部链接与非链接内容不改**：`http(s)://`、`//host`、`mailto:` 等外链不动；
+  `<img src>`、注释、文本、其他标签属性等均逐字节保留。
+- 改写完成后**沿用同一套链接解析与整包校验**（与 `/publish` 完全一致）；新路径冲突或
+  任一链接无法维持指向时，整次搬迁失败，**内容与修订号均不变**。
+- 过期 `expected_revision` 仍按发布接口的冲突规则返回 `409`（响应体相同）。
+- 成功时在**同一个 SQLite 写事务**内生成一个新修订（修订号 +1），历史快照仍可通过
+  `GET /pages?revision=N` 读取，原发布与读取接口继续可用。
+
 ## API
 
 | 方法 & 路径 | 说明 |
@@ -54,6 +79,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `GET /pages` | 当前修订的完整页面集合 `{"revision":n,"pages":{路径:内容}}` |
 | `GET /pages?revision=N` | 读取第 N 次发布的完整集合；不存在返回 404 |
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
+| `POST /move` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"...","new_path":"..."}` |
 
 ## 可执行的 HTTP 调用示例
 
@@ -108,15 +134,54 @@ curl -s http://localhost:8000/pages
 curl -s "http://localhost:8000/pages?revision=1"
 ```
 
+### 页面搬迁示例
+
+```bash
+# 再发布一页，并让 index 引用它（revision -> 3）
+curl -s -X POST http://localhost:8000/publish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 2,
+    "changes": [
+      {"op":"upsert","path":"/index.html","content":"<h1>首页</h1><a href=\"/docs/guide.html\">指南</a>"},
+      {"op":"upsert","path":"/docs/guide.html","content":"<a href=\"../index.html\">返回</a><h2 id=\"ch1\">第一章</h2>"}
+    ]
+  }'
+
+# 搬迁 /docs/guide.html -> /help/manual.html（revision -> 4）
+# index 中的 /docs/guide.html 自动改指 /help/manual.html；
+# 搬迁页自身的 ../index.html 按新位置重定位为 ../index.html（深度相同），id="ch1" 保留
+curl -s -X POST http://localhost:8000/move \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":3,"old_path":"/docs/guide.html","new_path":"/help/manual.html"}'
+# {"revision":4,"moved":true,"old_path":"/docs/guide.html","new_path":"/help/manual.html"}
+
+# 新路径已被占用 -> 422，内容与修订号不变
+curl -s -X POST http://localhost:8000/move \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":4,"old_path":"/help/manual.html","new_path":"/index.html"}'
+
+# 搬迁入口页 -> 422
+curl -s -X POST http://localhost:8000/move \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":4,"old_path":"/index.html","new_path":"/home.html"}'
+
+# 过期修订号 -> 409（与 /publish 同一冲突响应）
+curl -s -X POST http://localhost:8000/move \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"old_path":"/help/manual.html","new_path":"/x.html"}'
+```
+
 ## 项目结构
 
 ```
 app/
   db.py         # SQLite 连接、建表、修订号元数据
   linkcheck.py  # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
-  publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误
-  main.py       # FastAPI 路由与请求模型
-tests/          # pytest 端到端 + 链接解析单测（26 个用例）
+  publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误；提交修订辅助
+  move.py       # 页面搬迁：href 改指/重定位（仅改链接、逐字节保留其他内容）+ 整包校验
+  main.py       # FastAPI 路由与请求模型（/publish、/move）
+tests/          # pytest 端到端 + 链接解析/搬迁改写单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn

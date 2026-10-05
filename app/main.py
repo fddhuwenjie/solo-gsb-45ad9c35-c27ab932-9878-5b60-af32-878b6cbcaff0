@@ -10,7 +10,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import db
+from .move import move_page
 from .publish import PublishConflict, PublishValidationError, publish
+
+
+def _validate_site_path(v: str) -> str:
+    if not v.startswith("/"):
+        raise ValueError("path must start with '/'")
+    if len(v) < 2:
+        raise ValueError("path must not be empty")
+    if "#" in v or "?" in v:
+        raise ValueError("path must not contain query string or fragment")
+    return v
 
 
 class Change(BaseModel):
@@ -25,13 +36,7 @@ class Change(BaseModel):
     @field_validator("path")
     @classmethod
     def _validate_path(cls, v: str) -> str:
-        if not v.startswith("/"):
-            raise ValueError("path must start with '/'")
-        if len(v) < 2:
-            raise ValueError("path must not be empty")
-        if "#" in v or "?" in v:
-            raise ValueError("path must not contain query string or fragment")
-        return v
+        return _validate_site_path(v)
 
     @field_validator("content")
     @classmethod
@@ -45,6 +50,19 @@ class Change(BaseModel):
 class PublishRequest(BaseModel):
     expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
     changes: list[Change] = Field(default_factory=list)
+
+
+class MoveRequest(BaseModel):
+    """页面搬迁：已发布且非 /index.html 的旧路径 -> 未占用的新路径。"""
+
+    expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
+    old_path: str = Field(description="已发布的旧页面路径，必须以 / 开头，不能是 /index.html")
+    new_path: str = Field(description="未被占用的新页面路径，必须以 / 开头")
+
+    @field_validator("old_path", "new_path")
+    @classmethod
+    def _validate_path(cls, v: str) -> str:
+        return _validate_site_path(v)
 
 
 @asynccontextmanager
@@ -110,6 +128,45 @@ def publish_endpoint(req: PublishRequest):
             changes=[c.model_dump() for c in req.changes],
         )
         return {"revision": new_revision, "published": True}
+    except PublishConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "revision conflict",
+                "expected": req.expected_revision,
+                "current": exc.current_revision,
+            },
+        )
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/move")
+def move_endpoint(req: MoveRequest):
+    """页面搬迁：旧路径消失、新路径保留原正文与 id，相关站内 href 同步重定位。
+
+    改写、整包链接校验与新修订生成在同一 SQLite 写事务内完成；
+    新路径冲突或任一链接无法维持指向时整次搬迁失败，内容与修订号不变。
+    """
+    conn = db.connect()
+    try:
+        new_revision = move_page(
+            conn,
+            expected_revision=req.expected_revision,
+            old_path=req.old_path,
+            new_path=req.new_path,
+        )
+        return {
+            "revision": new_revision,
+            "moved": True,
+            "old_path": req.old_path,
+            "new_path": req.new_path,
+        }
     except PublishConflict as exc:
         return JSONResponse(
             status_code=409,

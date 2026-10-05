@@ -25,6 +25,21 @@ class PublishValidationError(Exception):
         super().__init__("publish validation failed")
 
 
+def commit_revision(
+    conn: sqlite3.Connection,
+    pages: dict[str, str],
+    current: int,
+) -> int:
+    """把最终页面集合写为新修订快照并推进修订号（调用方负责事务）。"""
+    new_revision = current + 1
+    conn.executemany(
+        "INSERT INTO pages (revision, path, content) VALUES (?, ?, ?)",
+        [(new_revision, path, content) for path, content in sorted(pages.items())],
+    )
+    conn.execute("UPDATE meta SET current_revision = ? WHERE id = 1", (new_revision,))
+    return new_revision
+
+
 def _load_current_pages(conn: sqlite3.Connection, revision: int) -> dict[str, str]:
     rows = conn.execute("SELECT path, content FROM pages WHERE revision = ?", (revision,)).fetchall()
     return {row["path"]: row["content"] for row in rows}
@@ -82,12 +97,7 @@ def publish(
             raise PublishValidationError(link_errors)
 
         # 4) 全部通过：写入新修订快照并推进修订号（仍在同一事务内）。
-        new_revision = current + 1
-        conn.executemany(
-            "INSERT INTO pages (revision, path, content) VALUES (?, ?, ?)",
-            [(new_revision, path, content) for path, content in sorted(pages.items())],
-        )
-        conn.execute("UPDATE meta SET current_revision = ? WHERE id = 1", (new_revision,))
+        new_revision = commit_revision(conn, pages, current)
         conn.commit()
         return new_revision
     except Exception:
