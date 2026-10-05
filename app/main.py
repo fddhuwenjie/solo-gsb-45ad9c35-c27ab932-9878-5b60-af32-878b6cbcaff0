@@ -11,6 +11,26 @@ from pydantic import BaseModel, Field, field_validator
 
 from . import db
 from .publish import PublishConflict, PublishValidationError, publish
+from .relocate import relocate
+
+
+class RelocateRequest(BaseModel):
+    """页面搬迁：把已发布的旧页面移动到未占用的新路径，并重写受影响的站内 href。"""
+
+    expected_revision: int = Field(ge=0, description="客户端预期的当前修订号，实现乐观锁")
+    old_path: str = Field(description="已发布的旧页面路径，必须以 / 开头，且不能是 /index.html")
+    new_path: str = Field(description="未占用的新页面路径，必须以 / 开头，且不能与旧路径相同")
+
+    @field_validator("old_path", "new_path")
+    @classmethod
+    def _validate_relocate_path(cls, v: str) -> str:
+        if not v.startswith("/"):
+            raise ValueError("path must start with '/'")
+        if len(v) < 2:
+            raise ValueError("path must not be empty")
+        if "#" in v or "?" in v:
+            raise ValueError("path must not contain query string or fragment")
+        return v
 
 
 class Change(BaseModel):
@@ -110,6 +130,41 @@ def publish_endpoint(req: PublishRequest):
             changes=[c.model_dump() for c in req.changes],
         )
         return {"revision": new_revision, "published": True}
+    except PublishConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": "revision conflict",
+                "expected": req.expected_revision,
+                "current": exc.current_revision,
+            },
+        )
+    except PublishValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "validation failed", "errors": exc.errors},
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/relocate")
+def relocate_endpoint(req: RelocateRequest):
+    """搬迁单个已发布页面并改写受影响的站内 href。校验与发布在同一 SQLite 写事务内完成。"""
+    conn = db.connect()
+    try:
+        new_revision = relocate(
+            conn,
+            expected_revision=req.expected_revision,
+            old_path=req.old_path,
+            new_path=req.new_path,
+        )
+        return {
+            "revision": new_revision,
+            "relocated": True,
+            "old_path": req.old_path,
+            "new_path": req.new_path,
+        }
     except PublishConflict as exc:
         return JSONResponse(
             status_code=409,

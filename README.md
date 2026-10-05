@@ -54,6 +54,47 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000   # 首次启动自动建表
 | `GET /pages` | 当前修订的完整页面集合 `{"revision":n,"pages":{路径:内容}}` |
 | `GET /pages?revision=N` | 读取第 N 次发布的完整集合；不存在返回 404 |
 | `POST /publish` | 批量发布，请求体 `{"expected_revision":n,"changes":[...]}` |
+| `POST /relocate` | 页面搬迁，请求体 `{"expected_revision":n,"old_path":"/a.html","new_path":"/b.html"}` |
+
+## 页面搬迁（`POST /relocate`）
+
+把一个**已发布且不是 `/index.html`** 的旧页面移动到**未占用**的新路径（新旧相同也视为冲突），
+并在同一个写事务内完成链接改写与整包校验，成功时生成新修订：
+
+- 旧路径消失，新页面**保留原有正文与元素 `id`**；
+- 其他页面中解析后指向旧页的站内 `href` 改指新页（绝对 `href` 用绝对新路径，
+  相对 `href` 用相对新路径），查询参数与 `#片段` 原样保留；
+- 搬迁页**自身的相对 `href`** 以新位置为基准重定位，使各链接原本指向的页面与片段
+  在搬迁后仍可到达；纯片段（`#x`）/纯查询（`?x`）指向本页，无需改写；
+- 外部链接与非链接内容（正文文本、注释、其他标签及属性等）一律不改；
+- 沿用既有的 href 解析规则与整包链接校验作为兜底：**新路径冲突，或任一链接无法
+  维持指向时，整次搬迁失败，内容与修订号均不变（422）**；
+- 过期 `expected_revision` 按发布接口同样的冲突规则返回 `409`；
+- 成功返回 `{"revision":n,"relocated":true,"old_path":...,"new_path":...}`，
+  历史修订快照仍可通过 `GET /pages?revision=N` 读取，原发布与读取接口不受影响。
+
+```bash
+# 搬迁页面（成功，revision -> N+1）：其他页面引用与搬迁页自身相对链接一并改写
+curl -s -X POST http://localhost:8000/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"old_path":"/docs/guide.html","new_path":"/manual/guide.html"}'
+# {"revision":2,"relocated":true,"old_path":"/docs/guide.html","new_path":"/manual/guide.html"}
+
+# 新路径已被占用（含新旧相同）-> 422，内容与修订号不变
+curl -s -X POST http://localhost:8000/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"old_path":"/about.html","new_path":"/index.html"}'
+
+# 搬迁入口页 /index.html -> 422
+curl -s -X POST http://localhost:8000/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":2,"old_path":"/index.html","new_path":"/home.html"}'
+
+# 过期修订号 -> 409（与 /publish 相同的冲突响应）
+curl -s -X POST http://localhost:8000/relocate \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision":1,"old_path":"/about.html","new_path":"/about2.html"}'
+```
 
 ## 可执行的 HTTP 调用示例
 
@@ -115,8 +156,9 @@ app/
   db.py         # SQLite 连接、建表、修订号元数据
   linkcheck.py  # href 解析（相对/绝对/#片段/查询串/越界）与整批链接校验
   publish.py    # 单写事务：试用整批改动 -> 校验 -> 提交；冲突/校验错误
-  main.py       # FastAPI 路由与请求模型
-tests/          # pytest 端到端 + 链接解析单测（26 个用例）
+  relocate.py   # 单写事务：页面搬迁、站内 href 改写（沿用 linkcheck）、整包校验、新修订
+  main.py       # FastAPI 路由与请求模型（/publish 与 /relocate）
+tests/          # pytest 端到端 + 链接解析/搬迁改写单测
 Dockerfile
 docker-compose.yml
 entrypoint.sh   # 启动时初始化数据库再拉起 uvicorn
